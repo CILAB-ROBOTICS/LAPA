@@ -291,6 +291,22 @@ class CustomSceneEnv(BaseEnv):
             else:
                 raise NotImplementedError(self.robot_uid)
             robot_init_rot_quat = [0, 0, 0, 1]
+        elif "panda" in self.robot_uid:
+            qpos = np.array(
+                [
+                    0.0,
+                    -np.pi / 4,
+                    0.0,
+                    -3 * np.pi / 4,
+                    0.0,
+                    np.pi / 2,
+                    np.pi / 4,
+                    0.04,
+                    0.04,
+                ]
+            )
+            robot_init_height = 0.85
+            robot_init_rot_quat = [0, 0, 0, 1]
         else:
             raise NotImplementedError(self.robot_uid)
         
