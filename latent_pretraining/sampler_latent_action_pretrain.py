@@ -3,6 +3,7 @@ import numpy as np
 import jax
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
+from flax.traverse_util import flatten_dict
 from transformers import GenerationConfig
 from tux import (
     define_flags_with_default, StreamingCheckpointer, JaxDistributedConfig,
@@ -120,9 +121,53 @@ class DeltaActionSampler:
         return {
             'input_ids': np.expand_dims(tokens, axis=0),
         }
-    
 
-    
+    @staticmethod
+    def _validate_action_checkpoint(params, checkpoint_path):
+        flat_params = flatten_dict(params)
+        required_param_paths = {
+            'action embedding': ('transformer', 'ate', 'embedding'),
+            'action output head': ('action_head', 'kernel'),
+        }
+        missing_params = [
+            name for name, path_suffix in required_param_paths.items()
+            if not any(path[-len(path_suffix):] == path_suffix for path in flat_params)
+        ]
+        if missing_params:
+            missing = ', '.join(missing_params)
+            raise ValueError(
+                f"Checkpoint {checkpoint_path!r} is not action-finetuned; "
+                f"it is missing {missing}. Use a checkpoint produced by "
+                "scripts/finetune_simpler.sh for SIMPLER evaluation."
+            )
+
+        return flat_params
+
+    @staticmethod
+    def _sync_vocab_sizes_with_checkpoint(llama_config, flat_params):
+        vocab_param_paths = {
+            'vision_vocab_size': ('transformer', 'vte', 'embedding'),
+            'delta_vocab_size': ('transformer', 'dte', 'embedding'),
+            'action_vocab_size': ('transformer', 'ate', 'embedding'),
+        }
+
+        for config_name, path_suffix in vocab_param_paths.items():
+            matching_params = [
+                value for path, value in flat_params.items()
+                if path[-len(path_suffix):] == path_suffix
+            ]
+            if not matching_params:
+                continue
+
+            checkpoint_size = matching_params[0].shape[0]
+            config_size = getattr(llama_config, config_name)
+            if config_size != checkpoint_size:
+                print(
+                    f"Updating {config_name} from {config_size} to {checkpoint_size} "
+                    "to match the loaded checkpoint."
+                )
+                llama_config.update({config_name: checkpoint_size})
+
     def _load_model(self):
         if self.FLAGS.load_llama_config != '':
             llama_config = VideoLLaMAConfig.load_config(self.FLAGS.load_llama_config)
@@ -157,8 +202,13 @@ class DeltaActionSampler:
 
         with jax.default_device(jax.devices("cpu")[0]):
             _, self.params = StreamingCheckpointer.load_trainstate_checkpoint(
-                    self.FLAGS.load_checkpoint, disallow_trainstate=True, max_buffer_size=32 * 2 ** 30
+                    self.FLAGS.load_checkpoint, disallow_trainstate=True,
             )
+            flat_params = self._validate_action_checkpoint(
+                self.params, self.FLAGS.load_checkpoint
+            )
+            self._sync_vocab_sizes_with_checkpoint(llama_config, flat_params)
+            self.config = llama_config
             self.model = FlaxVideoLLaMAForCausalLM(
                 llama_config, 
                 input_shape=(512, 8192), 
