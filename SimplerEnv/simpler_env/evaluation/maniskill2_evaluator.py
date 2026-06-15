@@ -40,7 +40,7 @@ def run_maniskill2_eval_single_episode(
 
     if additional_env_build_kwargs is None:
         additional_env_build_kwargs = {}
-
+    
     # Create environment
     kwargs = dict(
         obs_mode="rgbd",
@@ -63,7 +63,9 @@ def run_maniskill2_eval_single_episode(
         **additional_env_build_kwargs,
         **kwargs,
     )
-
+    
+    real_env = env.unwrapped
+    
     # initialize environment
     env_reset_options = {
         "robot_init_options": {
@@ -85,14 +87,14 @@ def run_maniskill2_eval_single_episode(
         }
     obs, _ = env.reset(options=env_reset_options)
     # for long-horizon environments, we check if the current subtask is the final subtask
-    is_final_subtask = env.is_final_subtask() 
+    is_final_subtask = real_env.is_final_subtask()
 
     # Obtain language instruction
     if instruction is not None:
         task_description = instruction
     else:
         # get default language instruction
-        task_description = env.get_language_instruction()
+        task_description = real_env.get_language_instruction()
 
     # Initialize logging
     image = get_image_from_maniskill2_obs_dict(env, obs, camera_name=obs_camera_name)
