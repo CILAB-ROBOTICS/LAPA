@@ -11,9 +11,9 @@ from pathlib import Path
 import gymnasium as gym
 import mediapy as media
 import numpy as np
-import simpler_env  # noqa: F401 - registers SimplerEnv environments
+# import simpler_env  # noqa: F401 - registers SimplerEnv environments
 import tensorflow as tf
-from mani_skill2_real2sim.utils.sapien_utils import look_at, vectorize_pose
+from ManiSkill2_real2sim.mani_skill2_real2sim.utils.sapien_utils import look_at, vectorize_pose
 
 from simpler_env.utils.env.observation_utils import (
     get_image_from_maniskill2_obs_dict,
