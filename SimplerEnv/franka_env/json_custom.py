@@ -50,7 +50,7 @@ def parse_args():
         action="store_true",
         help="Keep failed episodes too. By default, only successful episodes are exported.",
     )
-    parser.add_argument(
+    parser.add_argument(        # 사용 X, gripper action should be binary (0 or 1)
         "--continuous-gripper",
         action="store_true",
         help="Save the raw continuous gripper action instead of thresholding it to 0/1.",
