@@ -15,6 +15,8 @@ import numpy as np
 import tensorflow as tf
 from ManiSkill2_real2sim.mani_skill2_real2sim.utils.sapien_utils import look_at, vectorize_pose
 
+from scipy.spatial.transform import Rotation as R
+
 from simpler_env.utils.env.observation_utils import (
     get_image_from_maniskill2_obs_dict,
 )
@@ -160,6 +162,27 @@ class PandaRLWrapper(gym.Wrapper):
             self.base_env, obs, camera_name=CAMERA_NAME
         )
 
+    def _get_robot_state_dict(self):
+        """LAPA fine-tuning에 필요한 state 정보를 추출합니다."""
+        # EEF Position
+        eef_pos = self.base_env.tcp.pose.p.tolist()
+        
+        # EEF Euler (SAPIEN quat [w,x,y,z] -> Scipy quat [x,y,z,w] -> Euler)
+        quat_sapien = self.base_env.tcp.pose.q
+        quat_scipy = [quat_sapien[1], quat_sapien[2], quat_sapien[3], quat_sapien[0]]
+        eef_euler = R.from_quat(quat_scipy).as_euler('xyz').tolist()
+        
+        # Gripper State
+        # 0에 가까울수록 닫힘, 양수에 가까울 수록 열림
+        qpos = self.base_env.agent.robot.get_qpos()
+        gripper_state = float(np.mean(qpos[-2:]))   # Panda의 마지막 2개 joint가 gripper
+        
+        return {
+            "eef_pos": [float(x) for x in eef_pos],
+            "eef_euler": [float(x) for x in eef_euler],
+            "gripper_state": gripper_state
+        }
+    
     def reset(self, **kwargs):
         options = dict(kwargs.pop("options", {}) or {})
         options.setdefault(
@@ -178,6 +201,8 @@ class PandaRLWrapper(gym.Wrapper):
         self.previous_distance = np.linalg.norm(
             self.base_env.obj_pose.p - self.base_env.tcp.pose.p
         )
+        
+        info["robot_state"] = self._get_robot_state_dict()
         return self._state(), info
 
     def step(self, action):
@@ -193,7 +218,8 @@ class PandaRLWrapper(gym.Wrapper):
         reward += 1.0 * float(info["is_grasped"])
         reward += 5.0 * float(info["lifted_object_significantly"])
         reward += 10.0 * float(info["success"])
-        info["shaped_reward"] = reward
+        
+        info["robot_state"] = self._get_robot_state_dict()
         return self._state(), float(reward), terminated, truncated, info
 
 
