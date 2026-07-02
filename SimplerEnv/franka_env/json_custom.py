@@ -50,7 +50,7 @@ def parse_args():
         action="store_true",
         help="Keep failed episodes too. By default, only successful episodes are exported.",
     )
-    parser.add_argument(        # 사용 X, gripper action should be binary (0 or 1)
+    parser.add_argument(
         "--continuous-gripper",
         action="store_true",
         help="Save the raw continuous gripper action instead of thresholding it to 0/1.",
@@ -104,7 +104,7 @@ def action_to_raw_list(action, continuous_gripper):
 #     }
 
 # LAPA fintuning data format 참고
-def make_sample(sample_id, image_path, instruction, raw_action):
+def make_sample(sample_id, image_path, instruction, raw_action, states):
     return {
         "id": sample_id,
         "image": str(image_path),
@@ -115,7 +115,8 @@ def make_sample(sample_id, image_path, instruction, raw_action):
             },
             {
                 "from": "gpt",         # 수정
-                "raw_actions": raw_action
+                "raw_actions": raw_action,
+                "states": states       # 수정
             }
         ],
     }
@@ -140,10 +141,13 @@ def main():
 
     for episode in range(args.episodes):
         attempted_episodes += 1
-        observation, _ = env.reset(seed=args.seed + episode)
+        observation, info = env.reset(seed=args.seed + episode)
         episode_samples = []
         done = False
-        info = {"success": False}
+        
+        # reset 시점 state 처리
+        if "robot_state" not in info:
+            info["robot_state"] = {"eef_pos": [0,0,0], "eef_euler": [0,0,0], "gripper_state": 0.0}
 
         for step in range(args.max_steps):
             action, _, _ = expert.choose_action(model, observation, deterministic=True)
@@ -151,12 +155,14 @@ def main():
             sample_id = f"panda_ep{episode:04d}_step{step:04d}"
             image_path = args.image_dir / f"{sample_id}.png"
             media.write_image(image_path, to_uint8_image(env.last_frame))
+            
             episode_samples.append(
                 make_sample(
                     sample_id=sample_id,
                     image_path=image_path,
                     instruction=args.instruction,
                     raw_action=action_to_raw_list(action, args.continuous_gripper),
+                    states=info["robot_state"]
                 )
             )
 
