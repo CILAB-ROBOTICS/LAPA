@@ -93,13 +93,30 @@ def action_to_raw_list(action, continuous_gripper):
     return [float(x) for x in raw_action[:6]] + [raw_action[6]]
 
 
+# def make_sample(sample_id, image_path, instruction, raw_action):
+#     return {
+#         "id": sample_id,
+#         "image": str(image_path),
+#         "conversations": [
+#             {"value": f"<image>\n{instruction}"},
+#             {"raw_actions": raw_action},
+#         ],
+#     }
+
+# LAPA fintuning data format 참고
 def make_sample(sample_id, image_path, instruction, raw_action):
     return {
         "id": sample_id,
         "image": str(image_path),
         "conversations": [
-            {"value": f"<image>\n{instruction}"},
-            {"raw_actions": raw_action},
+            {
+                "from": "human",       # 수정
+                "value": f"<image>\nWhat action should the robot take to `{instruction}`" # 수정
+            },
+            {
+                "from": "gpt",         # 수정
+                "raw_actions": raw_action
+            }
         ],
     }
 
