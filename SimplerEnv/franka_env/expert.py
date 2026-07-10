@@ -543,6 +543,10 @@ def train(args):
         args.model_path.parent.mkdir(parents=True, exist_ok=True)
         model.save_weights(args.model_path)
         
+        if wandb_run is not None:
+            import wandb
+            wandb.save(str(args.model_path), base_path=str(args.model_path.parent))
+        
         tqdm.write(
             f"update steps={completed_steps}/{args.total_steps} "
             f"policy_loss={policy_loss:.4f} value_loss={value_loss:.4f}"
