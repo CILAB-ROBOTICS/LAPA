@@ -5,8 +5,10 @@ Examples:
     python "example_panda copy.py" test --episodes 10
 """
 
+import time
 import argparse
 from pathlib import Path
+from tqdm import tqdm
 
 import gymnasium as gym
 import mediapy as media
@@ -129,6 +131,7 @@ def make_raw_env(args):
                 "fov": args.fov,
             }
         },
+        max_episode_steps=250,  # env에서 최대 step 수
     )
 
 
@@ -138,11 +141,25 @@ class PandaRLWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.base_env = env.unwrapped
+        
+        # Phase 정보를 State로 전달하기 위해 shape 36 -> 37로 확장
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(36,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(37,), dtype=np.float32
         )
         self.last_frame = None
-        self.previous_distance = 0.0
+        
+        # Parameters for Rewards & Phase
+        self.margin = 0.15
+        # Phase 전환 임계값
+        self.hover_target_threshold = 0.08
+        self.grasp_target_threshold = 0.04
+        self.lift_target_margin = 0.12
+        
+        self.phase = 0
+        
+        self.min_dist = np.inf      # 신기록 갱신용
+        self.max_lift_z = -np.inf
+        self.init_can_z = 0.0
 
     def _state(self):
         qpos = self.base_env.agent.robot.get_qpos()
@@ -153,8 +170,12 @@ class PandaRLWrapper(gym.Wrapper):
         obj_height = np.array(
             [self.base_env.obj.pose.p[2] - self.base_env.obj_height_after_settle]
         )
+        
+        # 현재 Phase 정보 제공
+        phase_array = np.array([self.phase], dtype=np.float32)
+        
         return np.concatenate(
-            [qpos, qvel, tcp_pose, obj_pose, tcp_to_obj, obj_height]
+            [qpos, qvel, tcp_pose, obj_pose, tcp_to_obj, obj_height, phase_array]
         ).astype(np.float32)
 
     def _save_frame(self, obs):
@@ -163,19 +184,13 @@ class PandaRLWrapper(gym.Wrapper):
         )
 
     def _get_robot_state_dict(self):
-        """LAPA fine-tuning에 필요한 state 정보를 추출합니다."""
-        # EEF Position
         eef_pos = self.base_env.tcp.pose.p.tolist()
-        
-        # EEF Euler (SAPIEN quat [w,x,y,z] -> Scipy quat [x,y,z,w] -> Euler)
         quat_sapien = self.base_env.tcp.pose.q
         quat_scipy = [quat_sapien[1], quat_sapien[2], quat_sapien[3], quat_sapien[0]]
         eef_euler = R.from_quat(quat_scipy).as_euler('xyz').tolist()
         
-        # Gripper State
-        # 0에 가까울수록 닫힘, 양수에 가까울 수록 열림
         qpos = self.base_env.agent.robot.get_qpos()
-        gripper_state = float(np.mean(qpos[-2:]))   # Panda의 마지막 2개 joint가 gripper
+        gripper_state = float(np.mean(qpos[-2:]))
         
         return {
             "eef_pos": [float(x) for x in eef_pos],
@@ -185,41 +200,143 @@ class PandaRLWrapper(gym.Wrapper):
     
     def reset(self, **kwargs):
         options = dict(kwargs.pop("options", {}) or {})
-        options.setdefault(
-            "robot_init_options",
-            {"init_xy": [0.0, 0.0], "init_height": TABLE_HEIGHT},
-        )
-        options.setdefault(
-            "obj_init_options",
-            {
-                "init_xy": np.random.uniform([-0.32, -0.18], [-0.12, 0.18]),
-                "init_z": TABLE_HEIGHT,
-            },
-        )
+        
+        # curriculum_factor: 1.0은 가장 먼 시작 위치
+        curriculum_factor = options.pop("curriculum_factor", 1.0)
+        
+        options.setdefault("robot_init_options", {"init_xy": [0.0, 0.0], "init_height": TABLE_HEIGHT})
+        options.setdefault("obj_init_options", {"init_z": TABLE_HEIGHT})
+
         obs, info = self.env.reset(options=options, **kwargs)
+        
+        # Reverse Curriculum: P-controller로 초기 위치 조절
+        if curriculum_factor < 1.0:
+            tcp_pos = self.base_env.tcp.pose.p
+            can_pos = self.base_env.obj_pose.p
+            
+            pos_orig = tcp_pos.copy()
+            pos_easy = can_pos.copy()
+            pos_easy[2] += self.margin + 0.02
+            
+            target_pos = (1.0 - curriculum_factor) * pos_easy + curriculum_factor * pos_orig
+            
+            for _ in range(50):
+                current_tcp = self.base_env.tcp.pose.p
+                error = target_pos - current_tcp
+                if np.linalg.norm(error) < 0.005:
+                    break
+                
+                action = np.zeros(self.action_space.shape[0], dtype=np.float32)
+                action[:3] = np.clip(error * 10.0, -1.0, 1.0) 
+                action[-1] = 1.0  
+                self.base_env.step(action)
+            
+            # dummy step 통해 obs 획득
+            dummy_action = np.zeros(self.action_space.shape[0], dtype=np.float32)
+            dummy_action[-1] = 1.0
+            obs, _, _, _, info = self.env.step(dummy_action)
+            
         self._save_frame(obs)
-        self.previous_distance = np.linalg.norm(
-            self.base_env.obj_pose.p - self.base_env.tcp.pose.p
-        )
+        
+        tcp_pos = self.base_env.tcp.pose.p
+        can_pos = self.base_env.obj_pose.p
+        self.init_can_z = can_pos[2]
+        
+        self.phase = 0
+        self.max_lift_z = self.init_can_z
+        
+        target_pos = can_pos.copy()
+        target_pos[2] += self.margin
+        # 에피소드 시작 시 최고 기록(min_dist) 초기화
+        self.min_dist = np.linalg.norm(tcp_pos - target_pos) 
         
         info["robot_state"] = self._get_robot_state_dict()
         return self._state(), info
 
     def step(self, action):
-        obs, _, terminated, truncated, info = self.env.step(action)
+        # 그리퍼 액션 Discretization (양수 or 음수 -> 1.0 or -1.0)
+        discrete_action = np.copy(action)
+        discrete_action[-1] = 1.0 if discrete_action[-1] > 0.0 else -1.0
+        
+        obs, _, terminated, truncated, info = self.env.step(discrete_action)
         self._save_frame(obs)
 
-        distance = np.linalg.norm(self.base_env.obj_pose.p - self.base_env.tcp.pose.p)
-        progress = self.previous_distance - distance
-        self.previous_distance = distance
-
-        reward = 10.0 * progress + 0.1 * np.exp(-10.0 * distance)
-        reward -= 0.005 * float(np.square(action).sum())
-        reward += 1.0 * float(info["is_grasped"])
-        reward += 5.0 * float(info["lifted_object_significantly"])
-        reward += 10.0 * float(info["success"])
+        tcp_pos = self.base_env.tcp.pose.p
+        can_pos = self.base_env.obj_pose.p
         
+        reward = 0.0
+        is_success = False
+        
+        # 0. 충돌 / 실패 처리
+        if can_pos[2] < self.init_can_z - 0.04:
+            terminated = True
+            info["success"] = False
+            info["robot_state"] = self._get_robot_state_dict()
+            # 음수 패널티가 없으므로 지금까지 모은 + 보상이 Total Reward
+            return self._state(), float(reward), terminated, truncated, info
+
+        # 1. Phase 기반 Reward
+        if self.phase == 0:
+            target_pos = can_pos.copy()
+            target_pos[2] += self.margin
+            dist = np.linalg.norm(tcp_pos - target_pos)
+            
+            # 거리 기록 갱신하면 Reward
+            if dist < self.min_dist:
+                reward += (self.min_dist - dist) * 2.0
+                self.min_dist = dist  
+                
+            if dist <= self.hover_target_threshold:
+                self.phase = 1
+                reward += 0.5  # 전환 보너스
+                
+                # Phase 1 진입 시 그리퍼가 열려있다면 reward
+                if discrete_action[-1] > 0:
+                    reward += 1.0
+                    
+                target_pos_grasp = can_pos.copy()
+                
+                # Phase 1 타겟 (캔 상단 지점)
+                target_pos_grasp[2] += 0.08  
+                
+                self.min_dist = np.linalg.norm(tcp_pos - target_pos_grasp)
+                
+        elif self.phase == 1:
+            target_pos = can_pos.copy()
+            
+            # Phase 1 타겟 (캔 상단 지점)
+            target_pos[2] += 0.08 
+            
+            dist = np.linalg.norm(tcp_pos - target_pos)
+            
+            if dist < self.min_dist:
+                reward += (self.min_dist - dist) * 2.0
+                self.min_dist = dist
+                
+            if dist <= self.grasp_target_threshold:
+                self.phase = 2
+                reward += 0.5  
+                
+                # Phase 2 진입 시 그리퍼가 닫혀있다면 reward
+                if discrete_action[-1] < 0:
+                    reward += 2.0
+                    
+                self.max_lift_z = can_pos[2]
+                
+        elif self.phase == 2:
+            # 들어올린 높이 기록 갱신하면 Reward
+            if can_pos[2] > self.max_lift_z:
+                reward += (can_pos[2] - self.max_lift_z) * 10.0
+                self.max_lift_z = can_pos[2]
+                
+            if can_pos[2] > self.init_can_z + self.lift_target_margin:
+                reward += 1.0  
+                is_success = True
+                terminated = True
+
+        info["success"] = is_success
         info["robot_state"] = self._get_robot_state_dict()
+        
         return self._state(), float(reward), terminated, truncated, info
 
 
@@ -336,10 +453,18 @@ def train(args):
     model(tf.zeros((1, env.observation_space.shape[0])))
     optimizer = tf.keras.optimizers.Adam(args.learning_rate)
 
-    observation, _ = env.reset(seed=args.seed)
     episode_return = 0.0
     episode_count = 0
     completed_steps = 0
+    
+    curriculum_factor = 0.0
+    observation, _ = env.reset(seed=args.seed, options={"curriculum_factor": curriculum_factor})
+    
+    # 에피소드 시작 시간 기록
+    episode_start_time = time.time()
+
+    # tqdm 바 생성 (총 스텝 수 기준)
+    pbar = tqdm(total=args.total_steps, desc="Training Steps", unit="step")
 
     while completed_steps < args.total_steps:
         observations = []
@@ -362,13 +487,22 @@ def train(args):
             log_probs.append(log_prob)
             observation = next_observation
             episode_return += reward
+            
             completed_steps += 1
+            pbar.update(1)  # tqdm 바 1스텝 업데이트
 
             if done:
                 episode_count += 1
-                print(
+                episode_duration = time.time() - episode_start_time # 소요 시간 계산
+                
+                # 학습 70% 시점에서 curriculum_factor 1.0에 도달하도록
+                progress = completed_steps / args.total_steps
+                curriculum_factor = min(1.0, progress / 0.7)
+                
+                tqdm.write(
                     f"episode={episode_count} steps={completed_steps} "
-                    f"return={episode_return:.2f} success={info['success']}"
+                    f"return={episode_return:.2f} success={info['success']} "
+                    f"time={episode_duration:.1f}s curriculum={curriculum_factor:.2f}"
                 )
                 if wandb_run is not None:
                     wandb_run.log(
@@ -376,11 +510,14 @@ def train(args):
                             "train/episode_return": episode_return,
                             "train/episode_success": float(info["success"]),
                             "train/episode": episode_count,
+                            "train/episode_duration_sec": episode_duration, # WandB에 시간 기록
+                            "train/curriculum_factor": curriculum_factor, # WandB에 curriculum_factor 기록
                         },
                         step=completed_steps,
                     )
-                observation, _ = env.reset()
+                observation, _ = env.reset(options={"curriculum_factor": curriculum_factor})
                 episode_return = 0.0
+                episode_start_time = time.time() # 다음 에피소드 시간 측정 시작
 
         _, _, last_value = choose_action(model, observation, deterministic=True)
         advantages, returns = compute_gae(
@@ -405,7 +542,8 @@ def train(args):
         )
         args.model_path.parent.mkdir(parents=True, exist_ok=True)
         model.save_weights(args.model_path)
-        print(
+        
+        tqdm.write(
             f"update steps={completed_steps}/{args.total_steps} "
             f"policy_loss={policy_loss:.4f} value_loss={value_loss:.4f}"
         )
@@ -425,6 +563,7 @@ def train(args):
                 step=completed_steps,
             )
 
+    pbar.close()
     env.close()
     print(f"Saved PPO weights: {args.model_path.resolve()}")
     if wandb_run is not None:
@@ -440,8 +579,12 @@ def test(args):
 
     successes = 0
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    for episode in range(args.episodes):
-        observation, _ = env.reset(seed=args.seed + episode)
+    
+    for episode in tqdm(range(args.episodes), desc="Testing Episodes", unit="ep"):
+        episode_start_time = time.time() # 시간 측정 시작
+        
+        # 테스트 시 curriculum_factor 1.0으로 고정
+        observation, _ = env.reset(seed=args.seed + episode, options={"curriculum_factor": 1.0})
         frames = [env.last_frame]
         total_reward = 0.0
         done = False
@@ -454,23 +597,26 @@ def test(args):
             total_reward += reward
             done = terminated or truncated
 
+        episode_duration = time.time() - episode_start_time # 소요 시간 계산
         success = bool(info["success"])
         successes += int(success)
         video_path = VIDEO_DIR / f"episode_{episode:03d}_success_{int(success)}.mp4"
         media.write_video(video_path, frames, fps=5)
-        print(
+        
+        tqdm.write(
             f"test episode={episode + 1} return={total_reward:.2f} "
-            f"success={success} video={video_path}"
+            f"success={success} time={episode_duration:.1f}s video={video_path}"
         )
+        
         if wandb_run is not None:
             log_data = {
                 "test/episode_return": total_reward,
                 "test/episode_success": float(success),
                 "test/episode": episode + 1,
+                "test/episode_duration_sec": episode_duration, # 테스트 소요 시간 기록
             }
             if args.wandb_log_videos:
                 import wandb
-
                 log_data["test/video"] = wandb.Video(str(video_path), fps=5)
             wandb_run.log(log_data, step=episode + 1)
 
