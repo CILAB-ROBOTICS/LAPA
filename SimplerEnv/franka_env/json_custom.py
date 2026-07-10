@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
     parser.add_argument("--expert-script", type=Path, default=DEFAULT_EXPERT_SCRIPT)
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--instruction", type=str, default="pick coke can")
     parser.add_argument("--width", type=int, default=640)
