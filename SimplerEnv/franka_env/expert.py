@@ -8,6 +8,7 @@ Examples:
 import time
 import argparse
 from pathlib import Path
+from collections import deque
 from tqdm import tqdm
 
 import gymnasium as gym
@@ -32,6 +33,9 @@ LOG_TWO_PI = tf.constant(np.log(2.0 * np.pi), dtype=tf.float32)
 GAUSSIAN_ENTROPY_CONSTANT = tf.constant(
     0.5 * np.log(2.0 * np.pi * np.e), dtype=tf.float32
 )
+
+# Forced Final Phase 설정 (e,g., 0.8이면 전체 스텝의 80% 이후부터 난이도 1.0 고정, None이면 비활성)
+FORCED_FINAL_PHASE = 0.8 
 
 
 def parse_args():
@@ -254,9 +258,9 @@ class PandaRLWrapper(gym.Wrapper):
         return self._state(), info
 
     def step(self, action):
-        # 그리퍼 액션 Discretization (양수 or 음수 -> 1.0 or -1.0)
+        # 그리퍼 액션 Discretization (0 or 1 -> -1.0 or 1.0)
         discrete_action = np.copy(action)
-        discrete_action[-1] = 1.0 if discrete_action[-1] > 0.0 else -1.0
+        discrete_action[-1] = 1.0 if action[-1] == 1.0 else -1.0
         
         obs, _, terminated, truncated, info = self.env.step(discrete_action)
         self._save_frame(obs)
@@ -290,7 +294,7 @@ class PandaRLWrapper(gym.Wrapper):
                 self.phase = 1
                 reward += 0.5  # 전환 보너스
                 
-                # Phase 1 진입 시 그리퍼가 열려있다면 reward
+                # Phase 1 진입 시 그리퍼가 열려있다면 reward (discrete_action[-1]은 1.0 또는 -1.0)
                 if discrete_action[-1] > 0:
                     reward += 1.0
                     
@@ -353,10 +357,16 @@ class ActorCritic(tf.keras.Model):
                 tf.keras.layers.Dense(256, activation="tanh"),
             ]
         )
-        self.mean = tf.keras.layers.Dense(action_dim, activation="tanh")
+        # gripper action 분리
+        self.cont_dim = action_dim - 1
+        self.mean = tf.keras.layers.Dense(self.cont_dim, activation="tanh")
+        
+        # gripper action categorical logits (0: 닫기, 1: 열기)
+        self.gripper_logits = tf.keras.layers.Dense(2)
+        
         self.value = tf.keras.layers.Dense(1)
         self.log_std = self.add_weight(
-            shape=(action_dim,),
+            shape=(self.cont_dim,),
             initializer=tf.keras.initializers.Constant(-0.5),
             trainable=True,
             name="log_std",
@@ -365,7 +375,8 @@ class ActorCritic(tf.keras.Model):
 
     def call(self, observations):
         features = self.shared(observations)
-        return self.mean(features), tf.squeeze(self.value(features), axis=-1)
+        # mean, gripper_logits, value 리턴
+        return self.mean(features), self.gripper_logits(features), tf.squeeze(self.value(features), axis=-1)
 
 
 def gaussian_log_prob(actions, means, log_std):
@@ -378,14 +389,28 @@ def gaussian_log_prob(actions, means, log_std):
 
 def choose_action(model, observation, deterministic=False):
     obs_tensor = tf.convert_to_tensor(observation[None], dtype=tf.float32)
-    mean, value = model(obs_tensor)
+
+    mean, gripper_logits, value = model(obs_tensor)
+    
     if deterministic:
-        action = mean[0]
+        cont_action = mean[0]
+        gripper_action = tf.argmax(gripper_logits[0], output_type=tf.int32)
     else:
-        action = mean[0] + tf.exp(model.log_std) * tf.random.normal(mean[0].shape)
-    clipped_action = tf.clip_by_value(action, -1.0, 1.0)
-    log_prob = gaussian_log_prob(clipped_action[None], mean, model.log_std)[0]
-    return clipped_action.numpy(), float(log_prob), float(value[0])
+        cont_action = mean[0] + tf.exp(model.log_std) * tf.random.normal(mean[0].shape)
+        gripper_action = tf.random.categorical(gripper_logits, 1, dtype=tf.int32)[0, 0]
+        
+    clipped_cont_action = tf.clip_by_value(cont_action, -1.0, 1.0)
+    
+    cont_log_prob = gaussian_log_prob(clipped_cont_action[None], mean, model.log_std)[0]
+    
+    gripper_probs = tf.nn.softmax(gripper_logits[0])
+    gripper_log_prob = tf.math.log(gripper_probs[gripper_action] + 1e-8)
+    
+    total_log_prob = cont_log_prob + gripper_log_prob
+    
+    final_action = np.concatenate([clipped_cont_action.numpy(), [float(gripper_action.numpy())]])
+    
+    return final_action, float(total_log_prob), float(value[0])
 
 
 def compute_gae(rewards, values, dones, last_value, gamma, gae_lambda):
@@ -418,8 +443,17 @@ def update_policy(model, optimizer, data, args):
             ret_b = tf.convert_to_tensor(returns[batch], dtype=tf.float32)
 
             with tf.GradientTape() as tape:
-                means, values = model(obs_b)
-                log_probs = gaussian_log_prob(act_b, means, model.log_std)
+                means, gripper_logits, values = model(obs_b)
+                
+                cont_act_b = act_b[:, :-1]
+                gripper_act_b = tf.cast(act_b[:, -1], tf.int32)
+                
+                cont_log_probs = gaussian_log_prob(cont_act_b, means, model.log_std)
+                gripper_loss_calc = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=gripper_act_b, logits=gripper_logits)
+                gripper_log_probs = -gripper_loss_calc
+                
+                log_probs = cont_log_probs + gripper_log_probs
+                
                 ratio = tf.exp(log_probs - old_log_b)
                 clipped_ratio = tf.clip_by_value(
                     ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio
@@ -428,7 +462,12 @@ def update_policy(model, optimizer, data, args):
                     tf.minimum(ratio * adv_b, clipped_ratio * adv_b)
                 )
                 value_loss = tf.reduce_mean(tf.square(ret_b - values))
-                entropy = tf.reduce_sum(model.log_std + GAUSSIAN_ENTROPY_CONSTANT)
+                
+                entropy_cont = tf.reduce_sum(model.log_std + GAUSSIAN_ENTROPY_CONSTANT)
+                gripper_probs_dist = tf.nn.softmax(gripper_logits)
+                entropy_gripper = tf.reduce_mean(-tf.reduce_sum(gripper_probs_dist * tf.math.log(gripper_probs_dist + 1e-8), axis=-1))
+                entropy = entropy_cont + entropy_gripper
+                
                 loss = (
                     policy_loss
                     + tf.constant(0.5, dtype=tf.float32) * value_loss
@@ -458,6 +497,7 @@ def train(args):
     completed_steps = 0
     
     curriculum_factor = 0.0
+    success_history = deque(maxlen=100)  # 100개의 에피소드 성공 기록 관리
     observation, _ = env.reset(seed=args.seed, options={"curriculum_factor": curriculum_factor})
     
     # 에피소드 시작 시간 기록
@@ -495,14 +535,28 @@ def train(args):
                 episode_count += 1
                 episode_duration = time.time() - episode_start_time # 소요 시간 계산
                 
-                # 학습 70% 시점에서 curriculum_factor 1.0에 도달하도록
+                success_history.append(float(info["success"]))
+                
+                if len(success_history) > 0:
+                    recent_success_rate = sum(success_history) / len(success_history)
+                else:
+                    recent_success_rate = 0.0
+                
+                # 조건 달성시 난이도 상승 (5%)
+                if len(success_history) == 100 and recent_success_rate >= 0.5:
+                    curriculum_factor = min(1.0, curriculum_factor + 0.05)
+                    success_history.clear()
+                
+                # Forced Final Phase 적용
                 progress = completed_steps / args.total_steps
-                curriculum_factor = min(1.0, progress / 0.7)
+                if FORCED_FINAL_PHASE is not None and progress >= FORCED_FINAL_PHASE:
+                    curriculum_factor = 1.0
                 
                 tqdm.write(
                     f"episode={episode_count} steps={completed_steps} "
                     f"return={episode_return:.2f} success={info['success']} "
-                    f"time={episode_duration:.1f}s curriculum={curriculum_factor:.2f}"
+                    f"time={episode_duration:.1f}s curriculum={curriculum_factor:.2f} "
+                    f"success_rate={recent_success_rate:.2f}"
                 )
                 if wandb_run is not None:
                     wandb_run.log(
@@ -512,6 +566,7 @@ def train(args):
                             "train/episode": episode_count,
                             "train/episode_duration_sec": episode_duration, # WandB에 시간 기록
                             "train/curriculum_factor": curriculum_factor, # WandB에 curriculum_factor 기록
+                            "train/recent_success_rate": recent_success_rate, # WandB에 성공률 기록
                         },
                         step=completed_steps,
                     )
