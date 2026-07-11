@@ -135,7 +135,7 @@ def make_raw_env(args):
                 "fov": args.fov,
             }
         },
-        max_episode_steps=250,  # env에서 최대 step 수
+        max_episode_steps=350,  # env에서 최대 step 수
     )
 
 
