@@ -35,7 +35,7 @@ GAUSSIAN_ENTROPY_CONSTANT = tf.constant(
 )
 
 # Forced Final Phase 설정 (e,g., 0.8이면 전체 스텝의 80% 이후부터 난이도 1.0 고정, None이면 비활성)
-FORCED_FINAL_PHASE = 0.8 
+FORCED_FINAL_PHASE = None
 
 
 def parse_args():
