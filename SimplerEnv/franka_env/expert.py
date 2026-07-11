@@ -164,6 +164,9 @@ class PandaRLWrapper(gym.Wrapper):
         self.min_dist = np.inf      # 신기록 갱신용
         self.max_lift_z = -np.inf
         self.init_can_z = 0.0
+        
+        # 높이 중간 목표
+        self.lift_milestones = {0.03: False, 0.06: False, 0.09: False}
 
     def _state(self):
         qpos = self.base_env.agent.robot.get_qpos()
@@ -249,6 +252,8 @@ class PandaRLWrapper(gym.Wrapper):
         self.phase = 0
         self.max_lift_z = self.init_can_z
         
+        self.lift_milestones = {0.03: False, 0.06: False, 0.09: False}
+        
         target_pos = can_pos.copy()
         target_pos[2] += self.margin
         # 에피소드 시작 시 최고 기록(min_dist) 초기화
@@ -333,8 +338,15 @@ class PandaRLWrapper(gym.Wrapper):
                 reward += (can_pos[2] - self.max_lift_z) * 10.0
                 self.max_lift_z = can_pos[2]
                 
+            # 높이 중간 목표
+            current_lift_height = can_pos[2] - self.init_can_z
+            for milestone in [0.03, 0.06, 0.09]:
+                if current_lift_height >= milestone and not self.lift_milestones[milestone]:
+                    reward += 5.0
+                    self.lift_milestones[milestone] = True
+                
             if can_pos[2] > self.init_can_z + self.lift_target_margin:
-                reward += 1.0  
+                reward += 20.0      # task 최종 성공시 큰 reward
                 is_success = True
                 terminated = True
 
