@@ -22,6 +22,13 @@ from simpler_env.utils.env.observation_utils import (
 
 CAMERA_NAME = "base_camera"
 TABLE_HEIGHT = 0.882
+MIN_OBJ_HEIGHT = TABLE_HEIGHT - 0.3
+MAX_RESET_ATTEMPTS = 10
+# The can's cylinder axis is the object's local +y (see model_bbox_size);
+# when standing upright that axis points along world +z. Settling after the
+# drop-and-lock-then-unlock spawn can topple it over, so retry until it's
+# close enough to vertical (cos of the tilt angle from +z).
+MIN_UPRIGHT_DOT = 0.9
 MODEL_PATH = Path("checkpoints/panda_ppo.weights.h5")
 VIDEO_DIR = Path("videos/panda_ppo")
 LOG_TWO_PI = tf.constant(np.log(2.0 * np.pi), dtype=tf.float32)
@@ -34,6 +41,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train or test PPO with Panda.")
     parser.add_argument("mode", choices=["train", "test"])
     parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument(
+        "--init-weights",
+        type=Path,
+        default=None,
+        help="Warm-start train mode from these weights (e.g. a BC-pretrained "
+        "checkpoint from bc_pretrain.py) instead of random initialization.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=200_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
@@ -115,7 +129,10 @@ def make_raw_env(args):
         control_mode="pd_ee_delta_pose",
         obs_mode="rgbd",
         scene_name="dummy_tabletop",
-        scene_offset=[0.0, -0.21, 0.0],
+        # y=0 centers the table under the robot (init_xy=[0,0]) and the
+        # object spawn range (y in [-0.18, 0.18], centered on 0); the old
+        # -0.21 offset shifted the table sideways out from under both.
+        scene_offset=[0.0, 0.0, 0.0],
         scene_table_height=TABLE_HEIGHT,
         success_from_episode_stats=False,
         camera_cfgs={
@@ -161,19 +178,38 @@ class PandaRLWrapper(gym.Wrapper):
         )
 
     def reset(self, **kwargs):
-        options = dict(kwargs.pop("options", {}) or {})
-        options.setdefault(
+        base_options = dict(kwargs.pop("options", {}) or {})
+        base_options.setdefault(
             "robot_init_options",
             {"init_xy": [0.0, 0.0], "init_height": TABLE_HEIGHT},
         )
-        options.setdefault(
-            "obj_init_options",
-            {
-                "init_xy": np.random.uniform([-0.32, -0.18], [-0.12, 0.18]),
-                "init_z": TABLE_HEIGHT,
-            },
-        )
-        obs, info = self.env.reset(options=options, **kwargs)
+        for _ in range(MAX_RESET_ATTEMPTS):
+            options = dict(base_options)
+            options.setdefault(
+                "obj_init_options",
+                {
+                    # Shifted away from the robot base (world origin): the
+                    # old near edge (x=-0.12) was only 0.12m from the base,
+                    # uncomfortably close (near the arm's own body). This
+                    # keeps a minimum clearance of ~0.25m.
+                    "init_xy": np.random.uniform([-0.45, -0.18], [-0.25, 0.18]),
+                    "init_z": TABLE_HEIGHT,
+                },
+            )
+            obs, info = self.env.reset(options=options, **kwargs)
+            obj_rotation = self.base_env.obj_pose.to_transformation_matrix()[:3, :3]
+            can_up_axis = obj_rotation[:, 1]
+            is_upright = can_up_axis[2] >= MIN_UPRIGHT_DOT
+            if self.base_env.obj_pose.p[2] >= MIN_OBJ_HEIGHT and is_upright:
+                break
+            # Occasionally the object spawns far below the table (physics
+            # glitch in the settle step) and free-falls for the rest of the
+            # episode with no floor to stop it, blowing up the shaped reward,
+            # or topples onto its side during the post-drop settle. A fresh
+            # obj_init_options draw each attempt is required since the same
+            # xy would otherwise reproduce the same bad spawn every time.
+            kwargs["seed"] = None
+
         self._save_frame(obs)
         self.previous_distance = np.linalg.norm(
             self.base_env.obj_pose.p - self.base_env.tcp.pose.p
@@ -185,6 +221,15 @@ class PandaRLWrapper(gym.Wrapper):
         self._save_frame(obs)
 
         distance = np.linalg.norm(self.base_env.obj_pose.p - self.base_env.tcp.pose.p)
+
+        if self.base_env.obj_pose.p[2] < MIN_OBJ_HEIGHT:
+            # Object fell through/off the table and is free-falling with no
+            # floor in this scene to stop it. End the episode as a failure
+            # instead of letting the distance term diverge for the rest of
+            # the rollout.
+            info["shaped_reward"] = -5.0
+            return self._state(), -5.0, True, truncated, info
+
         progress = self.previous_distance - distance
         self.previous_distance = distance
 
@@ -308,6 +353,9 @@ def train(args):
     env = make_env(args)
     model = ActorCritic(env.action_space.shape[0])
     model(tf.zeros((1, env.observation_space.shape[0])))
+    if args.init_weights is not None:
+        model.load_weights(args.init_weights)
+        print(f"Warm-started from {args.init_weights}")
     optimizer = tf.keras.optimizers.Adam(args.learning_rate)
 
     observation, _ = env.reset(seed=args.seed)
