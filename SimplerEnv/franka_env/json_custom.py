@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
     parser.add_argument("--expert-script", type=Path, default=DEFAULT_EXPERT_SCRIPT)
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--instruction", type=str, default="pick coke can")
     parser.add_argument("--width", type=int, default=640)
@@ -93,13 +93,31 @@ def action_to_raw_list(action, continuous_gripper):
     return [float(x) for x in raw_action[:6]] + [raw_action[6]]
 
 
-def make_sample(sample_id, image_path, instruction, raw_action):
+# def make_sample(sample_id, image_path, instruction, raw_action):
+#     return {
+#         "id": sample_id,
+#         "image": str(image_path),
+#         "conversations": [
+#             {"value": f"<image>\n{instruction}"},
+#             {"raw_actions": raw_action},
+#         ],
+#     }
+
+# LAPA fintuning data format 참고
+def make_sample(sample_id, image_path, instruction, raw_action, states):
     return {
         "id": sample_id,
         "image": str(image_path),
         "conversations": [
-            {"value": f"<image>\n{instruction}"},
-            {"raw_actions": raw_action},
+            {
+                "from": "human",       # 수정
+                "value": f"<image>\nWhat action should the robot take to `{instruction}`" # 수정
+            },
+            {
+                "from": "gpt",         # 수정
+                "raw_actions": raw_action,
+                "states": states       # 수정
+            }
         ],
     }
 
@@ -123,10 +141,13 @@ def main():
 
     for episode in range(args.episodes):
         attempted_episodes += 1
-        observation, _ = env.reset(seed=args.seed + episode)
+        observation, info = env.reset(seed=args.seed + episode)
         episode_samples = []
         done = False
-        info = {"success": False}
+        
+        # reset 시점 state 처리
+        if "robot_state" not in info:
+            info["robot_state"] = {"eef_pos": [0,0,0], "eef_euler": [0,0,0], "gripper_state": 0.0}
 
         for step in range(args.max_steps):
             action, _, _ = expert.choose_action(model, observation, deterministic=True)
@@ -134,12 +155,14 @@ def main():
             sample_id = f"panda_ep{episode:04d}_step{step:04d}"
             image_path = args.image_dir / f"{sample_id}.png"
             media.write_image(image_path, to_uint8_image(env.last_frame))
+            
             episode_samples.append(
                 make_sample(
                     sample_id=sample_id,
                     image_path=image_path,
                     instruction=args.instruction,
                     raw_action=action_to_raw_list(action, args.continuous_gripper),
+                    states=info["robot_state"]
                 )
             )
 

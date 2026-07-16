@@ -3,8 +3,8 @@ from pathlib import Path
 
 import gymnasium as gym
 import mediapy as media
-import simpler_env  # noqa: F401 - imports and registers SimplerEnv environments
-from mani_skill2_real2sim.utils.sapien_utils import look_at
+# import simpler_env  # noqa: F401 - imports and registers SimplerEnv environments
+from ManiSkill2_real2sim.mani_skill2_real2sim.utils.sapien_utils import look_at
 
 from simpler_env.utils.env.observation_utils import (
     get_image_from_maniskill2_obs_dict,
