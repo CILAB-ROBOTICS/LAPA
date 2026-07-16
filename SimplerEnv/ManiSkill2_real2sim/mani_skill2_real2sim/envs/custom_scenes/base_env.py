@@ -179,7 +179,11 @@ class CustomSceneEnv(BaseEnv):
                 scene_pose = sapien.Pose([-0.192, -1.728, 1.48], [0.709, 0, 0, -0.705]) * scene_pose
             elif self.scene_name == "dummy_tabletop":
                 scene_pose = sapien.Pose()
-                scene_offset = np.array([0, -0.21, 0])
+                # y=0 centers the table under the robot (init_xy=[0,0]) and
+                # the object spawn range (y in [-0.18, 0.18]); the previous
+                # -0.21 offset shifted the table sideways out from under
+                # both, regardless of what scene_offset a caller passed in.
+                scene_offset = np.array([0, 0, 0])
 
         # Build scene
         if (self.scene_name is None) or ("dummy" not in self.scene_name):
@@ -196,7 +200,9 @@ class CustomSceneEnv(BaseEnv):
                 # builder.add_box_visual(half_size=np.array([10.0, 10.0, 0.017]), color=[0.6054843 , 0.34402566, 0.17013837])
             elif self.scene_name == "dummy_tabletop":
                 _pose = sapien.Pose([-0.295, 0, 0.017 + 0.865 / 2])
-                _half_size = np.array([0.63, 0.615, 0.865]) / 2
+                # Widened 2x sideways (y) to give the object more room to
+                # drift during grasp attempts without falling off the edge.
+                _half_size = np.array([0.63, 0.615 * 2, 0.865]) / 2
                 # _color = [0.325, 0.187, 0.1166]
                 _color = (np.array([168, 120, 79]) / 255) ** 2.2
                 rend_mtl = self._renderer.create_material()
