@@ -36,8 +36,8 @@ import numpy as np
 from flax.serialization import (from_bytes, from_state_dict, to_state_dict)
 from flax.traverse_util import empty_node, flatten_dict, unflatten_dict
 from tux.utils import open_file
-import tensorflow as tf
-tf.config.optimizer.set_jit(True)
+# import tensorflow as tf
+# tf.config.optimizer.set_jit(True)
 import time
 
 random.seed(time.time())
@@ -721,6 +721,11 @@ def main(argv):
             shard_fns = flatten_dict(
                 to_state_dict(shard_fns)
             )
+        flattened_target = None
+        if target is not None:
+            flattened_target = flatten_dict(
+                to_state_dict(target), keep_empty_nodes=True
+            )
         if remove_dict_prefix is not None:
             remove_dict_prefix = tuple(remove_dict_prefix)
         flattend_train_state = {}
@@ -734,15 +739,32 @@ def main(argv):
                         key = key[len(remove_dict_prefix):]
                     else:
                         continue
+                if flattened_target is not None and key not in flattened_target:
+                    logging.info(
+                        "Skipping checkpoint parameter absent from target model: %s",
+                        "/".join(key),
+                    )
+                    continue
                 tensor = from_bytes(None, value)
+                if flattened_target is not None:
+                    target_value = flattened_target[key]
+                    if (
+                        target_value != empty_node
+                        and tuple(tensor.shape) != tuple(target_value.shape)
+                    ):
+                        logging.info(
+                            "Skipping checkpoint parameter with changed shape: "
+                            "%s checkpoint=%s target=%s",
+                            "/".join(key),
+                            tuple(tensor.shape),
+                            tuple(target_value.shape),
+                        )
+                        continue
                 if shard_fns is not None:
                     tensor = shard_fns[key](tensor)
                 flattend_train_state[key] = tensor
 
         if target is not None:
-            flattened_target = flatten_dict(
-                to_state_dict(target), keep_empty_nodes=True
-            )
             for key, value in flattened_target.items():
                 if key not in flattend_train_state and value == empty_node:
                     flattend_train_state[key] = value

@@ -1947,7 +1947,7 @@ class JsonActionDataset(object):
                         dtype=bool
                     ),
                     'action_list': np.zeros(
-                        (local_batch_size, 7),
+                        (local_batch_size, self._text_processor.config.n_tokens_per_action),
                         dtype=np.float32
                     ),
                 }
